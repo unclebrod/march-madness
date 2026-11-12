@@ -2,13 +2,13 @@
 
 import os
 import time
-from typing import Literal
+from typing import Literal, TypedDict
 
 import polars as pl
 import requests
 from pydantic import BaseModel
 
-from march_madness.loader import DataConfig, DataLoader
+from march_madness.loader import DataLoader, Files
 from march_madness.settings import DATA_DIR
 
 STATUS = Literal[
@@ -26,6 +26,15 @@ LOCATION_TYPE = Literal[
     "GEOMETRIC_CENTER",
     "APPROXIMATE",
 ]
+
+
+class CityGeo(TypedDict):
+    city_id: int
+    city: str
+    state: str
+    lat: float
+    lng: float
+    elevation: float
 
 
 class Location(BaseModel):
@@ -104,10 +113,9 @@ def fetch_elevation(lat: float, lng: float, api_key: str | None = None) -> Eleva
 def geocode_cities() -> None:
     """Main function to geocode cities and save results to CSV."""
     data_loader = DataLoader(league="M")
-    data_config = DataConfig()
-    cities = data_loader.load_data(data_config.cities)
+    cities = data_loader.read(Files.cities)
 
-    cities_geo_list: list[dict] = []
+    cities_geo_list: list[CityGeo] = []
 
     for row in cities.iter_rows(named=True):
         # First, hit the geocode API to get latitude and longitude
@@ -129,14 +137,14 @@ def geocode_cities() -> None:
         time.sleep(0.1)
 
         cities_geo_list.append(
-            {
-                "city_id": row["CityID"],
-                "city": city,
-                "state": state,
-                "lat": lat,
-                "lng": lng,
-                "elevation": elevation_model.results[0].elevation,
-            }
+            CityGeo(
+                city_id=row["CityID"],
+                city=city,
+                state=state,
+                lat=lat,
+                lng=lng,
+                elevation=elevation_model.results[0].elevation,
+            )
         )
 
     pl.DataFrame(cities_geo_list).write_csv(DATA_DIR / "CitiesGeocoded.csv")

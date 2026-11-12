@@ -12,7 +12,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
 from march_madness.encoder import LabelEncoder, SequentialEncoder
-from march_madness.loader import DataConfig
+from march_madness.loader import Files
 from march_madness.log import logger
 from march_madness.models.base import NumpyroModel
 from march_madness.settings import OUTPUT_DIR
@@ -385,7 +385,7 @@ class PointsPerPossessionTrainer(Trainer):
                 pl.col("FirstD1Season").alias("first_d1_season"),
                 pl.col("LastD1Season").alias("last_d1_season"),
             ]
-        teams = self.data_loader.load_data(DataConfig.teams).select(teams_select)
+        teams = self.data_loader.read(Files.teams).select(teams_select)
 
         for k, v in self.model.samples.items():
             summary = summarize_samples(v)

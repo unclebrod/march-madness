@@ -1,15 +1,16 @@
 """Main entry point for March Madness modeling and analysis."""
 
 import numpyro
+import plotly.io as pio
 import polars as pl
 from cyclopts import App
 from dotenv import find_dotenv, load_dotenv
 
 from march_madness import geocoding, odds
-from march_madness.loader import DataConstructor
-from march_madness.log import logger
+from march_madness.elo import run_elo
+from march_madness.loader import DataLoader
+from march_madness.log import configure_logging
 from march_madness.models.base import McmcParams, SviParams
-from march_madness.models.elo import EloTrainer
 from march_madness.models.ppp import PointsPerPossessionTrainer
 from march_madness.settings import OUTPUT_DIR
 from march_madness.trainer import Trainer
@@ -17,7 +18,6 @@ from march_madness.tuner import Tuner
 
 TRAINER_MAP: dict[str, type[Trainer]] = {
     "ppp": PointsPerPossessionTrainer,
-    "elo": EloTrainer,
 }
 
 
@@ -36,7 +36,7 @@ def train(
     save: bool = True,
 ) -> None:
     logger.info(f"Training {model} model for {league} league with {inference} inference.")
-    data_constructor = DataConstructor(league=league)
+    data_constructor = DataLoader(league=league)
     trainer = TRAINER_MAP[model](league=league)
     df = data_constructor.load_game_team_box_scores()
     trainer.train(
@@ -76,7 +76,7 @@ def tune(
     n_trials: int = 50,
 ) -> None:
     logger.info(f"Tuning {model} model for {league} league.")
-    data_constructor = DataConstructor(league=league)
+    data_constructor = DataLoader(league=league)
     df = data_constructor.load_game_team_box_scores()
     trainer_cls = TRAINER_MAP[model]
     tuner = Tuner(
@@ -104,7 +104,7 @@ def submit(
     sfx = f"_{suffix}" if suffix else ""
     df_list: list[pl.DataFrame] = []
     for league in ["M", "W"]:
-        data_constructor = DataConstructor(league=league)
+        data_constructor = DataLoader(league=league)
         df = data_constructor.load_test_data(season=season)
         trainer = TRAINER_MAP[model].load(path=league)
         preds = trainer.predict(df=df)
@@ -129,7 +129,7 @@ def bracket(
     save: bool = True,
 ) -> None:
     logger.info(f"Creating bracket for {league} league for season {season}.")
-    data_constructor = DataConstructor(league=league)
+    data_constructor = DataLoader(league=league)
     data_constructor.create_bracket(season=season, save=save)
     logger.info("Bracket creation complete.")
 
@@ -139,7 +139,7 @@ def analysis(
     league: str = "M",
 ) -> None:
     logger.info(f"Running analysis for {league} league.")
-    data_constructor = DataConstructor(league=league)
+    data_constructor = DataLoader(league=league)
     data_constructor.analysis()
     logger.info("Analysis complete.")
 
@@ -158,10 +158,49 @@ def espn() -> None:
     logger.info("Odds fetching complete.")
 
 
+@app.command
+def elo(
+    league: str = "M",
+    *,
+    tune: bool = True,
+    n_trials: int = 100,
+    starting_rating: int = 0,
+    scale_factor: float = 400,
+    denominator_baseline: float = 7.5,
+    k_factor: float = 32,
+    season_carryover: float = 0.880909198124617,
+    hca: float = 0.4791259918853443,
+    decay: float = 0.8770430595292348,
+    shift: float = 5.011022004050616,
+    advantage_scale: float = 0.00032279515387965106,
+    max_upset_boost: float = 3.745746081635934,
+) -> None:
+    logger.info(f"Running Elo rating calculation for {league} league.")
+    run_elo(
+        league=league,
+        tune=tune,
+        n_trials=n_trials,
+        starting_rating=starting_rating,
+        scale_factor=scale_factor,
+        season_carryover=season_carryover,
+        hca=hca,
+        decay=decay,
+        shift=shift,
+        denominator_baseline=denominator_baseline,
+        k_factor=k_factor,
+        advantage_scale=advantage_scale,
+        max_upset_boost=max_upset_boost,
+    )
+    logger.info("Elo rating calculation complete.")
+
+
 if __name__ == "__main__":
     load_dotenv(find_dotenv())
+    configure_logging()
 
     numpyro.set_platform("cpu")
     numpyro.set_host_device_count(4)
+
+    pio.renderers.default = "browser"
 
     app()

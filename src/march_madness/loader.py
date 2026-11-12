@@ -1,11 +1,14 @@
+import logging
 from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import polars as pl
-from pydantic import BaseModel
 
 from march_madness.settings import (
     DATA_DIR,
@@ -13,19 +16,51 @@ from march_madness.settings import (
     OUTPUT_DIR,
     WITHIN_REGION_STANDARD_SEED_SETTINGS,
 )
-from march_madness.utils import (
-    current_season,
-    derive_rest_days,
-    derive_team_locations,
-    generate_ncaaw_homecourt,
-    haversine,
-)
+
+logger = logging.getLogger(__name__)
 
 pd.set_option("future.no_silent_downcasting", True)  # noqa
 
-T = TypeVar("T", bound=BaseModel)
-
 RECENCY_PADDING = 40
+EARTH_RADIUS_MILES = 3959.0
+
+GAME_RENAMER = {
+    "Season": "season",
+    "DayNum": "day_num",
+    "NumOT": "num_ot",
+    "WTeamID": "team1_id",
+    "WScore": "team1_score",
+    "WLoc": "team1_loc",
+    "WFGM": "team1_fgm",
+    "WFGA": "team1_fga",
+    "WFGM3": "team1_fg3m",
+    "WFGA3": "team1_fg3a",
+    "WFTM": "team1_ftm",
+    "WFTA": "team1_fta",
+    "WOR": "team1_orb",
+    "WDR": "team1_drb",
+    "WAst": "team1_ast",
+    "WTO": "team1_tov",
+    "WStl": "team1_stl",
+    "WBlk": "team1_blk",
+    "WPF": "team1_pf",
+    "LTeamID": "team2_id",
+    "LScore": "team2_score",
+    "LFGM": "team2_fgm",
+    "LFGA": "team2_fga",
+    "LFGM3": "team2_fg3m",
+    "LFGA3": "team2_fg3a",
+    "LFTM": "team2_ftm",
+    "LFTA": "team2_fta",
+    "LOR": "team2_orb",
+    "LDR": "team2_drb",
+    "LAst": "team2_ast",
+    "LTO": "team2_tov",
+    "LStl": "team2_stl",
+    "LBlk": "team2_blk",
+    "LPF": "team2_pf",
+    "SecondaryTourney": "secondary_tourney",
+}
 
 
 def _poss_expr(team_str: str, multiplier: float = 0.475) -> pl.Expr:
@@ -55,138 +90,320 @@ def _fill_null_location(
     )
 
 
-class FileConfig(BaseModel):
+def haversine(
+    lat1: str,
+    lon1: str,
+    lat2: str,
+    lon2: str,
+) -> pl.Expr:
+    """Vectorized Haversine distance (miles) as a Polars expression."""
+    lat1_rad = pl.col(lat1).radians()
+    lon1_rad = pl.col(lon1).radians()
+    lat2_rad = pl.col(lat2).radians()
+    lon2_rad = pl.col(lon2).radians()
+
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+
+    a = (dlat / 2).sin().pow(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2).sin().pow(2)
+
+    c = 2 * pl.arctan2(a.sqrt(), (1 - a).sqrt())
+
+    return EARTH_RADIUS_MILES * c
+
+
+def derive_team_locations(frame: pl.DataFrame) -> pl.DataFrame:
+    """Derive team locations based on game locations."""
+    team_city_frame = pl.concat(
+        [
+            frame.select(
+                team_id=pl.col("team1_id"),
+                team_loc=pl.col("team1_loc"),
+                season=pl.col("season"),
+                city=pl.col("city"),
+                state=pl.col("state"),
+            ),
+            frame.select(
+                team_id=pl.col("team2_id"),
+                team_loc=pl.col("team2_loc"),
+                season=pl.col("season"),
+                city=pl.col("city"),
+                state=pl.col("state"),
+            ),
+        ]
+    )
+    # These are teams where we can determine the location based on home games
+    existing_team_locations = (
+        team_city_frame.filter(
+            pl.col("team_loc").eq("H"),
+            pl.col("city").is_not_null(),
+        )
+        .group_by("team_id", "season")
+        .agg(pl.struct("city", "state").mode().sort().first().alias("location"))
+    )
+    # There are some teams for which we cannot determine the location within a season
+    # We identify them first
+    missing_team_locations = (
+        team_city_frame.select(["season", "team_id"])
+        .unique()
+        .join(
+            existing_team_locations.select(["season", "team_id"]).unique(),
+            on=["season", "team_id"],
+            how="anti",
+        )
+    )
+    # We combine them, and then backfill the past team years with future ones
+    # Helps pick up more teams than you would initially htink
+    team_locations = (
+        pl.concat([existing_team_locations, missing_team_locations], how="diagonal_relaxed")
+        .sort(["season", "team_id"])
+        .with_columns(pl.col("location").backward_fill().over(["team_id"]))
+        .unnest("location")
+    )
+    cities = frame.select(["city", "state", "lat", "lng", "elevation"]).unique().drop_nulls()
+    return team_locations.join(cities, on=["city", "state"], how="left")
+
+
+def derive_rest_days(frame: pl.DataFrame) -> pl.DataFrame:
+    """Derive rest days for teams based on game dates."""
+    return (
+        pl.concat(
+            [
+                frame.select(
+                    ID=pl.col("ID"),
+                    season=pl.col("season"),
+                    team_id=pl.col("team1_id"),
+                    days_into_season=pl.col("days_into_season"),
+                ),
+                frame.select(
+                    ID=pl.col("ID"),
+                    season=pl.col("season"),
+                    team_id=pl.col("team2_id"),
+                    days_into_season=pl.col("days_into_season"),
+                ),
+            ]
+        )
+        .sort(["season", "team_id", "days_into_season"])
+        .with_columns(
+            **{f"days_rest_{x}": pl.col("days_into_season").diff(x).over(["team_id", "season"]) for x in range(1, 4)}
+        )
+        .with_columns(
+            pl.col("days_rest_1").lt(1.5).alias("b2b").cast(pl.Int8).fill_null(0),
+            pl.col("days_rest_1").lt(2.5).alias("2in3").cast(pl.Int8).fill_null(0),
+            pl.col("days_rest_2").lt(3.5).alias("3in4").cast(pl.Int8).fill_null(0),
+            pl.col("days_rest_3").lt(4.5).alias("4in5").cast(pl.Int8).fill_null(0),
+        )
+        .drop("days_into_season", *[f"days_rest_{x}" for x in range(1, 4)])
+        .sort(["ID"])
+    )
+
+
+def build_team_game_box_scores(frame: pl.DataFrame) -> pl.DataFrame:
+    """Create both team perspectives, swapping team columns and reversing signed features."""
+    rename_dict = {
+        col: f"team2_{col.removeprefix('team1_')}"
+        if col.startswith("team1_")
+        else f"team1_{col.removeprefix('team2_')}"
+        for col in frame.columns
+        if col.startswith(("team1_", "team2_"))
+    }
+    # Paired team features swap above; these unpaired features are relative to team 1.
+    signed_columns = {
+        "spread",
+        "b2b_diff",
+        "2in3_diff",
+        "3in4_diff",
+        "4in5_diff",
+        "fatigue_score_diff",
+        "fatigue_effect_1",
+        "fatigue_effect_2",
+        "fatigue_effect_3",
+        "fatigue_effect_4",
+    }
+    swapped = (
+        frame.with_columns(-pl.col(col) for col in frame.columns if col in signed_columns)
+        .rename(rename_dict)
+        .select(frame.columns)
+    )
+    return pl.concat([frame, swapped], how="vertical").sort("season", "ID", "day_num", "team1_id")
+
+
+def generate_ncaaw_homecourt() -> pl.DataFrame:
+    """Generate NCAAW tournament home court advantage dataframe."""
+    regions = ["W", "X", "Y", "Z"]
+    seeds = list(range(1, 17))  # Seeds 1-16
+
+    matchups = []
+
+    # First round matchups
+    first_round_winners = {}  # Store possible winners for R2 matchups
+    for region in regions:
+        first_round_winners[region] = []
+        for i in range(8):  # 1 vs 16, 2 vs 15, ..., 8 vs 9
+            high_seed = seeds[i]
+            low_seed = seeds[-(i + 1)]
+            slot = f"R1{region}{i + 1}"
+            team_a = f"{region}{high_seed:02d}"
+            team_b = f"{region}{low_seed:02d}"
+            has_home_court = int(high_seed <= 4)  # Top 4 seeds host
+
+            matchups.append([slot, team_a, team_b, has_home_court])
+            first_round_winners[region].append((team_a, team_b))  # Save for R2
+
+    # Mapping from R2 slot -> host seed
+    # (1v16 vs 8v9 hosted by 1, etc.)
+    r2_host_seeds = [1, 2, 3, 4]
+
+    # Second round matchups (explicitly listing all combinations)
+    for region in regions:
+        for i in range(4):  # Each R2 slot is winner of (1 vs 16) vs winner of (8 vs 9), etc.
+            slot = f"R2{region}{i + 1}"
+
+            team_a_options = first_round_winners[region][i]  # Winner of high-seed game
+            team_b_options = first_round_winners[region][8 - i - 1]  # Winner of low-seed game
+
+            host_seed = r2_host_seeds[i]
+
+            for team_a in team_a_options:
+                for team_b in team_b_options:
+                    seed_a = int(team_a[1:])
+                    seed_b = int(team_b[1:])
+
+                    # Home court only exists if the host seed survives
+                    has_home_court = int(host_seed in {seed_a, seed_b})
+
+                    matchups.append([slot, team_a, team_b, has_home_court])
+
+    return pl.DataFrame(
+        matchups,
+        schema=["Slot", "StrongSeed", "WeakSeed", "team1_home"],
+        orient="row",
+    )
+
+
+def current_season() -> int:
+    """Get the current NCAA season based on today's date."""
+    today = datetime.now(ZoneInfo("America/New_York"))
+    year = today.year
+    if today.month >= 11:  # November or later
+        return year + 1
+    return year
+
+
+@dataclass(frozen=True, slots=True)
+class FileConfig:
     """File configuration convenience class."""
 
-    filename: str
+    name: str
     requires_league: bool
     men_only: bool = False
 
 
-class DataConfig[T]:
+class Files:
     """Container for keeping track of file loading configurations."""
 
-    cities: T = FileConfig(filename="Cities", requires_league=False)
-    cities_geocoded: T = FileConfig(filename="CitiesGeocoded", requires_league=False)
-    conferences: T = FileConfig(filename="Conferences", requires_league=False)
-    conference_tourney_games: T = FileConfig(filename="ConferenceTourneyGames", requires_league=True)
-    game_cities: T = FileConfig(filename="GameCities", requires_league=True)
-    massey_ordinals: T = FileConfig(filename="MasseyOrdinals", requires_league=True, men_only=True)
-    ncaa_tourney_compact_results: T = FileConfig(filename="NCAATourneyCompactResults", requires_league=True)
-    ncaa_tourney_detailed_results: T = FileConfig(filename="NCAATourneyDetailedResults", requires_league=True)
-    ncaa_tourney_seed_round_slots: T = FileConfig(
-        filename="NCAATourneySeedRoundSlots", requires_league=True, men_only=True
-    )
-    ncaa_tourney_seeds: T = FileConfig(filename="NCAATourneySeeds", requires_league=True)
-    ncaa_tourney_slots: T = FileConfig(filename="NCAATourneySlots", requires_league=True)
-    regular_season_compact_results: T = FileConfig(filename="RegularSeasonCompactResults", requires_league=True)
-    regular_season_detailed_results: T = FileConfig(filename="RegularSeasonDetailedResults", requires_league=True)
-    seasons: T = FileConfig(filename="Seasons", requires_league=True)
-    secondary_tourney_compact_results: T = FileConfig(filename="SecondaryTourneyCompactResults", requires_league=True)
-    secondary_tourney_teams: T = FileConfig(filename="SecondaryTourneyTeams", requires_league=True)
-    team_coaches: T = FileConfig(filename="TeamCoaches", requires_league=True, men_only=True)
-    team_conferences: T = FileConfig(filename="TeamConferences", requires_league=True)
-    teams: T = FileConfig(filename="Teams", requires_league=True)
-    team_spellings: T = FileConfig(filename="TeamSpellings", requires_league=True)
-    sample_submissions_stage_1: T = FileConfig(filename="SampleSubmissionStage1", requires_league=False)
-    sample_submissions_stage_2: T = FileConfig(filename="SampleSubmissionStage2", requires_league=False)
-    seed_benchmark_stage_1: T = FileConfig(filename="SeedBenchmarkStage1", requires_league=False)
+    cities = FileConfig(name="Cities", requires_league=False)
+    cities_geocoded = FileConfig(name="CitiesGeocoded", requires_league=False)
+    conferences = FileConfig(name="Conferences", requires_league=False)
+    conference_tourney_games = FileConfig(name="ConferenceTourneyGames", requires_league=True)
+    game_cities = FileConfig(name="GameCities", requires_league=True)
+    massey_ordinals = FileConfig(name="MasseyOrdinals", requires_league=True, men_only=True)
+    ncaa_tourney_compact_results = FileConfig(name="NCAATourneyCompactResults", requires_league=True)
+    ncaa_tourney_detailed_results = FileConfig(name="NCAATourneyDetailedResults", requires_league=True)
+    ncaa_tourney_seed_round_slots = FileConfig(name="NCAATourneySeedRoundSlots", requires_league=True, men_only=True)
+    ncaa_tourney_seeds = FileConfig(name="NCAATourneySeeds", requires_league=True)
+    ncaa_tourney_slots = FileConfig(name="NCAATourneySlots", requires_league=True)
+    regular_season_compact_results = FileConfig(name="RegularSeasonCompactResults", requires_league=True)
+    regular_season_detailed_results = FileConfig(name="RegularSeasonDetailedResults", requires_league=True)
+    seasons = FileConfig(name="Seasons", requires_league=True)
+    secondary_tourney_compact_results = FileConfig(name="SecondaryTourneyCompactResults", requires_league=True)
+    secondary_tourney_teams = FileConfig(name="SecondaryTourneyTeams", requires_league=True)
+    team_coaches = FileConfig(name="TeamCoaches", requires_league=True, men_only=True)
+    team_conferences = FileConfig(name="TeamConferences", requires_league=True)
+    teams = FileConfig(name="Teams", requires_league=True)
+    team_spellings = FileConfig(name="TeamSpellings", requires_league=True)
+    sample_submissions_stage_1 = FileConfig(name="SampleSubmissionStage1", requires_league=False)
+    sample_submissions_stage_2 = FileConfig(name="SampleSubmissionStage2", requires_league=False)
+    seed_benchmark_stage_1 = FileConfig(name="SeedBenchmarkStage1", requires_league=False)
 
 
-class DataLoader(BaseModel):
-    """Class for easily loading data given a configuration."""
+@dataclass(frozen=True, slots=True)
+class DataLoader:
+    """Class responsible for loading and constructing data for use downstream."""
 
     league: Literal["M", "W"] = "M"
     data_dir: Path = DATA_DIR
 
-    def load_data(self, config: FileConfig) -> pl.DataFrame:
+    def read(self, config: FileConfig) -> pl.DataFrame:
         if self.league != "M" and config.men_only:
             raise ValueError("The selected data is only available for men.")
         prefix = self.league if config.requires_league else ""
-        return pl.read_csv(DATA_DIR / f"{prefix}{config.filename}.csv")
-
-
-class DataConstructor:
-    """Class responsible for loading and constructing data for use downstream."""
-
-    def __init__(self, league: Literal["M", "W"] = "M", **kwargs):
-        self.league = league
-        self.data_loader = DataLoader(league=league, **kwargs)
-        self.data_config = DataConfig()
+        loc = self.data_dir / f"{prefix}{config.name}.csv"
+        logger.info("Reading data from %s...", loc)
+        return pl.read_csv(loc)
 
     def load_game_box_scores(self) -> pl.DataFrame:
         """Return box score and other game-level information with one row per game."""
-        teams = self.data_loader.load_data(self.data_config.teams)
-        regular_season_results = self.data_loader.load_data(self.data_config.regular_season_detailed_results)
-        playoff_results = self.data_loader.load_data(self.data_config.ncaa_tourney_detailed_results)
-        secondary_results = self.data_loader.load_data(self.data_config.secondary_tourney_compact_results)
-        conferences = self.data_loader.load_data(self.data_config.team_conferences)
-        conference_tourney_games = self.data_loader.load_data(self.data_config.conference_tourney_games)
-        seasons = self.data_loader.load_data(self.data_config.seasons)
-        game_cities = self.data_loader.load_data(self.data_config.game_cities)
-        cities = self.data_loader.load_data(self.data_config.cities_geocoded)
-        renamer = {
-            "Season": "season",
-            "DayNum": "day_num",
-            "NumOT": "num_ot",
-            "WTeamID": "team1_id",
-            "WScore": "team1_score",
-            "WLoc": "team1_loc",
-            "WFGM": "team1_fgm",
-            "WFGA": "team1_fga",
-            "WFGM3": "team1_fg3m",
-            "WFGA3": "team1_fg3a",
-            "WFTM": "team1_ftm",
-            "WFTA": "team1_fta",
-            "WOR": "team1_orb",
-            "WDR": "team1_drb",
-            "WAst": "team1_ast",
-            "WTO": "team1_tov",
-            "WStl": "team1_stl",
-            "WBlk": "team1_blk",
-            "WPF": "team1_pf",
-            "WTeamConf": "team1_conf_abbr",
-            "LTeamID": "team2_id",
-            "LScore": "team2_score",
-            "LFGM": "team2_fgm",
-            "LFGA": "team2_fga",
-            "LFGM3": "team2_fg3m",
-            "LFGA3": "team2_fg3a",
-            "LFTM": "team2_ftm",
-            "LFTA": "team2_fta",
-            "LOR": "team2_orb",
-            "LDR": "team2_drb",
-            "LAst": "team2_ast",
-            "LTO": "team2_tov",
-            "LStl": "team2_stl",
-            "LBlk": "team2_blk",
-            "LPF": "team2_pf",
-            "LTeamConf": "team2_conf_abbr",
-            "SecondaryTourney": "secondary_tourney",
-        }
-        df = (
+        logger.info("Creating game team box scores...")
+        # Load the files up front to make easy references during joins
+        teams = self.read(Files.teams)
+        regular_season_results = self.read(Files.regular_season_detailed_results)
+        playoff_results = self.read(Files.ncaa_tourney_detailed_results)
+        secondary_results = self.read(Files.secondary_tourney_compact_results)
+        conferences = self.read(Files.team_conferences)
+        conference_tourney_games = self.read(Files.conference_tourney_games)
+        seasons = self.read(Files.seasons)
+        game_cities = self.read(Files.game_cities)
+        # Geocoded city information is created via `geocoding.py`
+        cities = self.read(Files.cities_geocoded)
+
+        # Join and rename columns for personal preference and consistency
+        frame = (
             pl.concat(
                 [
-                    regular_season_results.with_columns(is_ncaa_tourney=0, is_secondary_tourney=0),
-                    playoff_results.with_columns(is_ncaa_tourney=1, is_secondary_tourney=0),
-                    secondary_results.with_columns(is_ncaa_tourney=0, is_secondary_tourney=1),
+                    regular_season_results.with_columns(
+                        is_ncaa_tourney=pl.lit(value=False),
+                        is_secondary_tourney=pl.lit(value=False),
+                    ),
+                    playoff_results.with_columns(
+                        is_ncaa_tourney=pl.lit(value=True),
+                        is_secondary_tourney=pl.lit(value=False),
+                    ),
+                    # The secondary tournament is not fully detailed like the other game sources
+                    secondary_results.with_columns(
+                        is_ncaa_tourney=pl.lit(value=False),
+                        is_secondary_tourney=pl.lit(value=True),
+                    ),
                 ],
                 how="diagonal_relaxed",
             )
+            .rename(GAME_RENAMER)
             .join(
-                conferences.rename({"ConfAbbrev": "WTeamConf", "TeamID": "WTeamID"}),
+                conferences.rename(
+                    {
+                        "ConfAbbrev": "team1_conf",
+                        "TeamID": "team1_id",
+                        "Season": "season",
+                    }
+                ),
                 how="left",
-                on=["Season", "WTeamID"],
+                on=["season", "team1_id"],
             )
             .join(
-                conferences.rename({"ConfAbbrev": "LTeamConf", "TeamID": "LTeamID"}),
+                conferences.rename(
+                    {
+                        "ConfAbbrev": "team2_conf",
+                        "TeamID": "team2_id",
+                        "Season": "season",
+                    }
+                ),
                 how="left",
-                on=["Season", "LTeamID"],
+                on=["season", "team2_id"],
             )
             .join(
                 teams.rename(
                     {
-                        "TeamID": "WTeamID",
+                        "TeamID": "team1_id",
                         "TeamName": "team1_name",
                         "FirstD1Season": "team1_first_d1_season",
                         "LastD1Season": "team1_last_d1_season",
@@ -195,12 +412,12 @@ class DataConstructor:
                     strict=False,
                 ),
                 how="left",
-                on=["WTeamID"],
+                on=["team1_id"],
             )
             .join(
                 teams.rename(
                     {
-                        "TeamID": "LTeamID",
+                        "TeamID": "team2_id",
                         "TeamName": "team2_name",
                         "FirstD1Season": "team2_first_d1_season",
                         "LastD1Season": "team2_last_d1_season",
@@ -209,16 +426,25 @@ class DataConstructor:
                     strict=False,
                 ),
                 how="left",
-                on=["LTeamID"],
+                on=["team2_id"],
             )
             .join(
-                conference_tourney_games.rename({"ConfAbbrev": "conf_tourney_abbr"}),
+                conference_tourney_games.rename(
+                    {
+                        "ConfAbbrev": "conf_tourney_abbr",
+                        "Season": "season",
+                        "DayNum": "day_num",
+                        "WTeamID": "team1_id",
+                        "LTeamID": "team2_id",
+                    }
+                ),
                 how="left",
-                on=["Season", "DayNum", "WTeamID", "LTeamID"],
+                on=["season", "day_num", "team1_id", "team2_id"],
             )
             .join(
                 seasons.rename(
                     {
+                        "Season": "season",
                         "DayZero": "day_zero",
                         "RegionW": "region_w",
                         "RegionX": "region_x",
@@ -226,12 +452,21 @@ class DataConstructor:
                         "RegionZ": "region_z",
                     }
                 ),
-                on=["Season"],
+                on=["season"],
                 how="left",
             )
             .join(
-                game_cities.rename({"CRType": "cr_type", "CityID": "city_id"}),
-                on=["Season", "DayNum", "WTeamID", "LTeamID"],
+                game_cities.rename(
+                    {
+                        "CRType": "cr_type",
+                        "CityID": "city_id",
+                        "Season": "season",
+                        "DayNum": "day_num",
+                        "WTeamID": "team1_id",
+                        "LTeamID": "team2_id",
+                    }
+                ),
+                on=["season", "day_num", "team1_id", "team2_id"],
                 how="left",
             )
             .join(
@@ -239,15 +474,23 @@ class DataConstructor:
                 on=["city_id"],
                 how="left",
             )
-            .rename(renamer)
             .sort(["season", "day_num", "team1_id"])
+            .with_row_index("ID")
             .with_columns(
                 team2_loc=pl.col("team1_loc").replace({"H": "A", "A": "H"}),
-                is_conf_tourney=pl.col("conf_tourney_abbr").is_not_null().cast(int),
+                is_conf_tourney=pl.col("conf_tourney_abbr").is_not_null(),
                 day_zero=pl.col("day_zero").str.to_date("%m/%d/%Y"),
+                minutes=pl.lit(40).add(pl.col("num_ot").mul(pl.lit(5))),
+                spread=pl.col("team1_score").sub(pl.col("team2_score")),
+                total=pl.col("team1_score").add(pl.col("team2_score")),
+                team1_win=pl.col("team1_score").gt(pl.col("team2_score")),
+                team2_win=pl.col("team2_score").gt(pl.col("team1_score")),
+                team1_poss=_poss_expr("team1"),
+                team2_poss=_poss_expr("team2"),
+                # Before 2003, there's only secondary results
+                # `days_into_season` won't fully make sense for these early seasons
                 days_into_season=pl.col("day_num").sub(pl.col("day_num").min().over("season")),
             )
-            .with_row_index("ID")
             .with_columns(
                 days_into_season_norm=pl.col("days_into_season").truediv(
                     pl.col("days_into_season").max().over("season")
@@ -257,110 +500,25 @@ class DataConstructor:
                 .add(pl.lit(RECENCY_PADDING))
                 .truediv(pl.col("days_into_season").add(pl.lit(RECENCY_PADDING)).max().over("season")),
                 date=pl.col("day_zero").add(pl.duration(days=pl.col("day_num"))),
-                minutes=pl.lit(40).add(pl.col("num_ot").mul(pl.lit(5))),
-                spread=pl.col("team1_score").sub(pl.col("team2_score")),
-                total=pl.col("team1_score").add(pl.col("team2_score")),
-                team1_home=pl.col("team1_loc").eq("H").cast(int),
-                team2_home=pl.col("team2_loc").eq("H").cast(int),
-                is_neutral=pl.col("team1_loc").eq("N").cast(int),
-                team1_win=pl.col("team1_score").gt(pl.col("team2_score")).cast(int),
-                team2_win=pl.col("team2_score").gt(pl.col("team1_score")).cast(int),
-                team1_poss=_poss_expr("team1"),
-                team2_poss=_poss_expr("team2"),
+                team1_home=pl.col("team1_loc").eq("H"),
+                team2_home=pl.col("team2_loc").eq("H"),
+                is_neutral=pl.col("team1_loc").eq("N"),
+                avg_poss=pl.col("team1_poss").add(pl.col("team2_poss")).truediv(2),
+                team1_pace=pl.col("team1_poss").truediv(pl.col("minutes")),
+                team2_pace=pl.col("team2_poss").truediv(pl.col("minutes")),
             )
             .with_columns(
                 days_into_season_norm_sq=pl.col("days_into_season_norm").pow(2),
-                team1_ppp=pl.col("team1_score").truediv(pl.col("team1_poss")),
-                team2_ppp=pl.col("team2_score").truediv(pl.col("team2_poss")),
-                team1_pace=pl.col("team1_poss").truediv(pl.col("minutes")),
-                team2_pace=pl.col("team2_poss").truediv(pl.col("minutes")),
-                avg_poss=pl.col("team1_poss").add(pl.col("team2_poss")).truediv(2).round(0),
-            )
-            .with_columns(
+                # Use the average possessions for PPP calculations - smoother, more stable
                 team1_ppp=pl.col("team1_score").truediv(pl.col("avg_poss")),
                 team2_ppp=pl.col("team2_score").truediv(pl.col("avg_poss")),
                 avg_pace=pl.col("avg_poss").truediv(pl.col("minutes")),
             )
-            .sort(["season", "ID", "day_num", "team1_id"])
         )
-        if self.league == "M":
-            # TODO: check if this changes - as of now, these are men's only data
-            coaches = self.data_loader.load_data(self.data_config.team_coaches)
-            massey_ordinals = (
-                self.data_loader.load_data(self.data_config.massey_ordinals)
-                .with_columns(SystemName=pl.format("ranking_{}", pl.col("SystemName").str.to_lowercase()))
-                .pivot(
-                    on=["SystemName"],
-                    index=["Season", "RankingDayNum", "TeamID"],
-                    values=["OrdinalRank"],
-                )
-                .rename({"Season": "season", "TeamID": "team_id", "RankingDayNum": "day_num"})
-            )
-            rank_cols = [x for x in massey_ordinals.columns if x.startswith("ranking_")]
-            massey_ordinals = massey_ordinals.sort(["season", "team_id", "day_num"]).with_columns(
-                *[pl.col(x).forward_fill().over(["season", "team_id"]) for x in rank_cols]
-            )
-
-            df = (
-                df.join_where(
-                    coaches,
-                    pl.col("season").eq(pl.col("Season")),
-                    pl.col("team1_id").eq(pl.col("TeamID")),
-                    pl.col("day_num").ge(pl.col("FirstDayNum")),
-                    pl.col("day_num").le(pl.col("LastDayNum")),
-                )
-                .drop(["Season", "TeamID", "FirstDayNum", "LastDayNum"])
-                .rename({"CoachName": "team1_coach"})
-                .join_where(
-                    coaches,
-                    pl.col("season").eq(pl.col("Season")),
-                    pl.col("team1_id").eq(pl.col("TeamID")),
-                    pl.col("day_num").ge(pl.col("FirstDayNum")),
-                    pl.col("day_num").le(pl.col("LastDayNum")),
-                )
-                .drop(["Season", "TeamID", "FirstDayNum", "LastDayNum"])
-                .rename({"CoachName": "team2_coach"})
-                .sort(["season", "team1_id", "day_num"])
-                .join_asof(
-                    massey_ordinals.rename({x: f"team1_{x}" for x in rank_cols} | {"team_id": "team1_id"}),
-                    by=["season", "team1_id"],
-                    on="day_num",
-                    strategy="backward",
-                    check_sortedness=False,
-                )
-                .join_asof(
-                    massey_ordinals.rename({x: f"team2_{x}" for x in rank_cols} | {"team_id": "team2_id"}),
-                    by=["season", "team2_id"],
-                    on="day_num",
-                    strategy="backward",
-                    check_sortedness=False,
-                )
-                .sort(["season", "ID", "day_num", "team1_id"])
-            )
-
-        return df
-
-    def load_game_team_box_scores(self) -> pl.DataFrame:
-        """Return box score and other game-level information with one row per team-game (two rows per game)."""
-        game_box_scores = self.load_game_box_scores()
-        rename_dict = {
-            col: col.replace("team1_", "TEMP_").replace("team2_", "team1_").replace("TEMP_", "team2_")
-            for col in game_box_scores.columns
-            if col.startswith("team1_") or col.startswith("team2_")
-        }
-        game_team_box_scores = pl.concat(
-            [
-                game_box_scores,
-                game_box_scores.with_columns(spread=pl.col("spread").mul(pl.lit(-1)))
-                .rename(rename_dict)
-                .select(game_box_scores.columns),
-            ],
-            how="vertical",
-        ).sort("season", "ID", "day_num", "team1_id")
-        team_locations = derive_team_locations(game_team_box_scores)
-        team_rest = derive_rest_days(game_team_box_scores)
-        return (
-            game_team_box_scores.join(
+        team_locations = derive_team_locations(frame)
+        team_rest = derive_rest_days(frame)
+        frame = (
+            frame.join(
                 team_locations.rename(
                     {
                         "team_id": "team1_id",
@@ -475,12 +633,82 @@ class DataConstructor:
                 fatigue_effect_4=pl.col("4in5_diff").add(pl.col("fatigue_effect_3")),
             )
         )
+        if self.league == "M":
+            # TODO: These are men's only data, but check if this changes in the future
+            coaches = self.read(Files.team_coaches)
+            massey_ordinals = (
+                self.read(Files.massey_ordinals)
+                .with_columns(SystemName=pl.format("ranking_{}", pl.col("SystemName").str.to_lowercase()))
+                .pivot(
+                    on=["SystemName"],
+                    index=["Season", "RankingDayNum", "TeamID"],
+                    values=["OrdinalRank"],
+                )
+                .rename(
+                    {
+                        "Season": "season",
+                        "TeamID": "team_id",
+                        "RankingDayNum": "day_num",
+                    }
+                )
+            )
+            ranking_cols = [x for x in massey_ordinals.columns if x.startswith("ranking_")]
+            massey_ordinals = massey_ordinals.sort(["season", "team_id", "day_num"]).with_columns(
+                *[pl.col(x).forward_fill().over(["season", "team_id"]) for x in ranking_cols]
+            )
+
+            frame = (
+                frame.join_where(
+                    coaches,
+                    pl.col("season").eq(pl.col("Season")),
+                    pl.col("team1_id").eq(pl.col("TeamID")),
+                    pl.col("day_num").ge(pl.col("FirstDayNum")),
+                    pl.col("day_num").le(pl.col("LastDayNum")),
+                    how="left",
+                )
+                .drop(["Season", "TeamID", "FirstDayNum", "LastDayNum"])
+                .rename({"CoachName": "team1_coach"})
+                .join_where(
+                    coaches,
+                    pl.col("season").eq(pl.col("Season")),
+                    pl.col("team2_id").eq(pl.col("TeamID")),
+                    pl.col("day_num").ge(pl.col("FirstDayNum")),
+                    pl.col("day_num").le(pl.col("LastDayNum")),
+                    how="left",
+                )
+                .drop(["Season", "TeamID", "FirstDayNum", "LastDayNum"])
+                .rename({"CoachName": "team2_coach"})
+                .sort(["season", "team1_id", "day_num"])
+                .join_asof(
+                    massey_ordinals.rename({x: f"team1_{x}" for x in ranking_cols} | {"team_id": "team1_id"}),
+                    by=["season", "team1_id"],
+                    on="day_num",
+                    strategy="backward",
+                    check_sortedness=False,
+                )
+                .sort(["season", "team2_id", "day_num"])
+                .join_asof(
+                    massey_ordinals.rename({x: f"team2_{x}" for x in ranking_cols} | {"team_id": "team2_id"}),
+                    by=["season", "team2_id"],
+                    on="day_num",
+                    strategy="backward",
+                    check_sortedness=False,
+                )
+                .sort(["season", "day_num", "team1_id"])
+            )
+
+        return frame
+
+    def load_game_team_box_scores(self) -> pl.DataFrame:
+        """Return box score and other game-level information with one row per team-game (two rows per game)."""
+        logger.info("Creating game team box scores...")
+        return build_team_game_box_scores(self.load_game_box_scores())
 
     def load_test_data(self, season: int | None = None) -> pl.DataFrame:
         season = season or current_season()
-        teams = self.data_loader.load_data(self.data_config.teams)
+        teams = self.read(Files.teams)
         test_df = (
-            self.data_loader.load_data(self.data_config.sample_submissions_stage_2)
+            self.read(Files.sample_submissions_stage_2)
             .with_columns(
                 id_split=pl.col("ID").str.split("_"),
             )
@@ -530,11 +758,7 @@ class DataConstructor:
         if self.league == "W":
             # TODO: fill in null team IDs (result of last four play-in games)
             # In the women's tourney, higher seeds have home court advantage in the first two rounds
-            tourney_seeds = (
-                self.data_loader.load_data(self.data_config.ncaa_tourney_seeds)
-                .filter(pl.col("Season").eq(season))
-                .drop("Season")
-            )
+            tourney_seeds = self.read(Files.ncaa_tourney_seeds).filter(pl.col("Season").eq(season)).drop("Season")
             homecourt_df = (
                 generate_ncaaw_homecourt()
                 .join(
@@ -584,9 +808,9 @@ class DataConstructor:
     def create_bracket(self, season: int | None = None, *, save: bool = True) -> None:
         """Generate a bracket for the NCAA tournament."""
         season = season or current_season()
-        teams = self.data_loader.load_data(self.data_config.teams)
+        teams = self.read(Files.teams)
         tourney_seeds = (
-            self.data_loader.load_data(self.data_config.ncaa_tourney_seeds)
+            self.read(Files.ncaa_tourney_seeds)
             .filter(pl.col("Season").eq(current_season()))
             .join(
                 teams.select("TeamID", "TeamName"),
@@ -698,12 +922,10 @@ class DataConstructor:
         advance_df.to_csv(OUTPUT_DIR / f"{self.league}/advance_{self.league}_{season}.csv")
 
     def analysis(self) -> None:
-        tourney_slots = self.data_loader.load_data(self.data_config.ncaa_tourney_slots)
-        tourney_seeds = self.data_loader.load_data(self.data_config.ncaa_tourney_seeds)
-        results = self.data_loader.load_data(self.data_config.ncaa_tourney_compact_results).drop(
-            "DayNum", "WLoc", "NumOT"
-        )
-        teams = self.data_loader.load_data(self.data_config.teams).drop("FirstD1Season", "LastD1Season")
+        tourney_slots = self.read(Files.ncaa_tourney_slots)
+        tourney_seeds = self.read(Files.ncaa_tourney_seeds)
+        results = self.read(Files.ncaa_tourney_compact_results).drop("DayNum", "WLoc", "NumOT")
+        teams = self.read(Files.teams).drop("FirstD1Season", "LastD1Season")
 
         df = (
             tourney_slots.join(
@@ -728,14 +950,24 @@ class DataConstructor:
             )
             .join(
                 results.rename(
-                    {"WTeamID": "StrongTeamID", "LTeamID": "WeakTeamID", "WScore": "StrongScore", "LScore": "WeakScore"}
+                    {
+                        "WTeamID": "StrongTeamID",
+                        "LTeamID": "WeakTeamID",
+                        "WScore": "StrongScore",
+                        "LScore": "WeakScore",
+                    }
                 ),
                 on=["Season", "StrongTeamID", "WeakTeamID"],
                 how="left",
             )
             .update(
                 results.rename(
-                    {"WTeamID": "WeakTeamID", "LTeamID": "StrongTeamID", "WScore": "WeakScore", "LScore": "StrongScore"}
+                    {
+                        "WTeamID": "WeakTeamID",
+                        "LTeamID": "StrongTeamID",
+                        "WScore": "WeakScore",
+                        "LScore": "StrongScore",
+                    }
                 ),
                 on=["Season", "StrongTeamID", "WeakTeamID"],
                 how="left",
